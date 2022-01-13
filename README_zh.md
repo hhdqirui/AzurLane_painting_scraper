@@ -13,3 +13,5 @@
 - Selenium
 
 ## 欢迎使用与提交PR
+
+[English](https://github.com/hhdqirui/AzurLane_painting_scraper)
