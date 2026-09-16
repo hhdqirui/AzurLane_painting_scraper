@@ -5,13 +5,16 @@ every ship gallery, one request per changed gallery returns its rendered page, a
 the original paintings are downloaded straight from the image server in parallel.
 
 Every painting variant of every skin is saved (Default, Without BG, Censored, ...).
-Images that already exist in the output folder are skipped, so re-running the
-scraper only downloads new skins.
+`--include` additionally downloads the artwork the wiki keeps outside the ship
+galleries: story CGs, loading screens, comics and so on, each enumerated from a
+wiki category. Images that already exist in the output folder are skipped, so
+re-running the scraper only downloads what is new.
 """
 import argparse
 import hashlib
 import json
 import os
+import re
 import string
 import sys
 import threading
@@ -40,6 +43,72 @@ MANIFEST_SAVE_INTERVAL = 25
 DOWNLOAD_ATTEMPTS = 2
 # this many failed requests in a row almost always means the wiki is blocking us
 MAX_FAILURES_IN_A_ROW = 10
+CATEGORY_LIMIT = 500
+
+# Artwork that is not a ship painting. Each collection becomes one folder in the
+# output directory and is filled from the wiki categories listed here, which give
+# the original image URLs directly, so no page has to be parsed.
+COLLECTIONS = {
+    'story': {
+        'folder': 'story',
+        'about': 'story CGs and their backgrounds, in a folder per story',
+        'categories': ['Memory artwork', 'Memory backgrounds', 'Memories', 'Permanent Memories',
+                       'Record Memories', 'Campaign Memories', 'Event Memories'],
+        'group_by_story': True,
+    },
+    'loading': {
+        'folder': 'loading screens',
+        'about': 'event splash art and the faction update screens',
+        'categories': ['Loading Screens', 'Update Screens'],
+    },
+    'comics': {
+        'folder': 'comics',
+        'about': 'the official comic strips',
+        'categories': ['Comics', 'Manga and Anime'],
+    },
+    'juustagram': {
+        'folder': 'juustagram',
+        'about': 'in-game Juustagram posts',
+        'categories': ['Juustagram'],
+    },
+    'backgrounds': {
+        'folder': 'backgrounds',
+        'about': 'the background layer shown behind skin paintings',
+        'categories': ['Skin Backgrounds'],
+    },
+    'sirens': {
+        'folder': 'sirens',
+        'about': 'Siren artwork, chibis and icons',
+        'categories': ['Sirens', 'Siren Chibi', 'Siren icons', 'Siren Shipyard icons'],
+    },
+    'artwork': {
+        'folder': 'artwork',
+        'about': 'gallery artwork, living area art and other one-off illustrations',
+        'categories': ['Gallery Artwork', 'Living Area', 'Humans', 'Crescendo of Polaris Images'],
+    },
+    'banners': {
+        'folder': 'banners',
+        'about': 'event banners',
+        'categories': ['Event banners', 'Permanent event banners', 'Event banners JP', 'Arcade banners'],
+    },
+    'icons': {
+        'folder': 'icons',
+        'about': 'ship, shipyard and chibi icons',
+        'categories': ['Ship icons', 'Shipyard icons', 'Chibi icons'],
+    },
+    'collectibles': {
+        'folder': 'collectibles',
+        'about': 'album stickers, medallions, portrait frames and memory thumbnails',
+        'categories': ['Commemorative Album stickers', 'Commemorative Album thumbnails', 'Medallions',
+                       'Portrait frames', 'Memory thumbnails', 'Character Memory folders', 'Chat stickers'],
+    },
+}
+# "art" is the drawn artwork, leaving out the comic strips as well as the icons
+ART_COLLECTIONS = ('story', 'loading', 'backgrounds', 'sirens', 'artwork')
+# `Memory A Rose on the High Tower CG 3.png` belongs to the story "A Rose on the High Tower"
+STORY_RE = re.compile(r'Memory (.+?) (?:CG|Background|Sprite|Chibi)\b', re.IGNORECASE)
+# keeps collection entries in the manifest apart from the `<ship>|<file>` painting entries
+COLLECTION_KEY_PREFIX = '@'
 
 PUNCTUATION_TABLE = str.maketrans('', '', string.punctuation)
 WINDOWS_ILLEGAL_TABLE = str.maketrans('', '', '<>:"/\\|?*')
@@ -100,6 +169,72 @@ def fetch_ship_names():
             break
         params = data['continue']
     return sorted(names)
+
+
+def fetch_category_files(category):
+    """Return [{wiki_file, url, size}] for every image in a wiki category.
+
+    The category listing already carries the URL of each original image, so one
+    request covers up to 500 files and nothing has to be parsed out of a page.
+    """
+    found = []
+    params = {}
+    while True:
+        if stop_event.is_set():
+            raise Cancelled
+        data = api_get(action='query', generator='categorymembers', gcmtitle='Category:' + category,
+                       gcmtype='file', gcmlimit=CATEGORY_LIMIT, prop='imageinfo', iiprop='url|size|mime',
+                       **params)
+        if 'error' in data:
+            raise RuntimeError('category "{}" failed: {}'.format(category, data['error'].get('info')))
+        # a category that does not exist simply comes back without any pages
+        for page in data.get('query', {}).get('pages', []):
+            info = (page.get('imageinfo') or [{}])[0]
+            # categories also hold the odd sound clip or video, which is not wanted here
+            if info.get('url') and (info.get('mime') or '').startswith('image/'):
+                found.append({'wiki_file': page['title'].split(':', 1)[1],
+                              'url': info['url'], 'size': info.get('size') or 0})
+        if 'continue' not in data:
+            return found
+        params = data['continue']
+
+
+def fetch_collection_files(key):
+    """Return the images of every wiki category that makes up a collection."""
+    found = {}
+    for category in COLLECTIONS[key]['categories']:
+        for item in fetch_category_files(category):
+            # a few files are filed under two of the categories
+            found.setdefault(item['wiki_file'], item)
+    return sorted(found.values(), key=lambda item: item['wiki_file'])
+
+
+def safe_path_part(name):
+    return name.translate(WINDOWS_ILLEGAL_TABLE).strip(' .') or 'unnamed'
+
+
+def collection_path(key, wiki_file):
+    """Where one collection image is saved, relative to the output folder.
+
+    Wiki file names are already descriptive and unique, so they are kept as they
+    are. Story images are additionally split into a folder per story.
+    """
+    parts = [COLLECTIONS[key]['folder']]
+    if COLLECTIONS[key].get('group_by_story'):
+        story = STORY_RE.match(wiki_file)
+        if story:
+            parts.append(safe_path_part(story.group(1)))
+    parts.append(safe_path_part(wiki_file))
+    return os.path.join(*parts)
+
+
+def expand_collections(names):
+    """Turn --include values into collection keys, expanding the "art" and "all" shortcuts."""
+    keys = []
+    for name in names or []:
+        chosen = ART_COLLECTIONS if name == 'art' else tuple(COLLECTIONS) if name == 'all' else (name,)
+        keys += [key for key in chosen if key not in keys]
+    return keys
 
 
 def has_class(cls):
@@ -257,6 +392,8 @@ def normalize(filename):
 def download(task, out_dir):
     """Download one painting to the output folder and return its size in bytes."""
     path = os.path.join(out_dir, task['filename'])
+    # collection images are saved in subfolders, paintings straight into out_dir
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     part_path = path + '.part'
     for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
         if stop_event.is_set():
@@ -336,22 +473,47 @@ def parse_args():
     parser.add_argument('--ships', nargs='+', metavar='NAME', help='only scrape these ships, e.g. --ships Akagi "Emile Bertin"')
     parser.add_argument('--dry-run', action='store_true', help='list the images that would be downloaded without downloading')
     parser.add_argument('--force', action='store_true', help='re-read every gallery and download images again even if they already exist')
+    parser.add_argument('--include', nargs='+', metavar='NAME', default=[],
+                        choices=sorted(COLLECTIONS) + ['art', 'all'],
+                        help='also download artwork that is not a ship painting; "art" selects the drawn '
+                             'artwork and "all" every collection (see --list-collections)')
+    parser.add_argument('--no-paintings', action='store_true',
+                        help='skip the ship paintings and download only the --include collections')
+    parser.add_argument('--list-collections', action='store_true',
+                        help='show what --include accepts and exit')
     return parser.parse_args()
+
+
+def print_collections():
+    print('Collections that --include accepts:')
+    for key in sorted(COLLECTIONS):
+        print('  {:<13} {}'.format(key, COLLECTIONS[key]['about']))
+    print('\nShortcuts:')
+    print('  {:<13} {}'.format('art', ', '.join(ART_COLLECTIONS)))
+    print('  {:<13} {}'.format('all', ', '.join(COLLECTIONS)))
 
 
 def main():
     args = parse_args()
+    if args.list_collections:
+        print_collections()
+        return 0
+    collections = expand_collections(args.include)
+    if args.no_paintings and not collections:
+        print('--no-paintings leaves nothing to do; add --include (see --list-collections)')
+        return 1
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
     manifest_path = os.path.join(out_dir, MANIFEST_NAME)
     manifest = load_manifest(manifest_path)
     files, galleries = manifest['files'], manifest['galleries']
 
-    ships = args.ships or fetch_ship_names()
+    ships = [] if args.no_paintings else (args.ships or fetch_ship_names())
     touched, no_gallery = fetch_gallery_timestamps(ships)
     # only galleries edited since the last run need to be read again
     changed = [ship for ship in touched if args.force or galleries.get(ship, {}).get('touched') != touched[ship]]
-    print('{} ships, {} galleries changed since the last run'.format(len(ships), len(changed)))
+    if ships:
+        print('{} ships, {} galleries changed since the last run'.format(len(ships), len(changed)))
 
     # Phase 1: find every painting of every skin
     failures = []
@@ -419,10 +581,37 @@ def main():
                     continue
             tasks.append(dict(painting, ship=ship, filename=filename, key=key))
 
-    total_images = sum(len(p) for p in paintings_by_ship.values())
-    total_skins = sum(len({p['skin'] for p in paintings}) for paintings in paintings_by_ship.values())
-    print('\nFound {} skins and {} images: {} already downloaded, {} new'.format(
-        total_skins, total_images, present, len(tasks)))
+    if ships:
+        total_images = sum(len(p) for p in paintings_by_ship.values())
+        total_skins = sum(len({p['skin'] for p in paintings}) for paintings in paintings_by_ship.values())
+        print('\nFound {} skins and {} images: {} already downloaded, {} new'.format(
+            total_skins, total_images, present, len(tasks)))
+
+    # Phase 2b: artwork that lives outside the ship galleries
+    if collections:
+        print('\nArtwork collections:')
+    for key in collections:
+        try:
+            items = fetch_collection_files(key)
+        except Exception as e:
+            print('  {:<13} FAILED to list: {}'.format(key, e))
+            failures.append('{} (collection): {}'.format(key, e))
+            continue
+        new_bytes = 0
+        new_count = 0
+        for item in items:
+            filename = collection_path(key, item['wiki_file'])
+            manifest_key = '{}{}|{}'.format(COLLECTION_KEY_PREFIX, key, item['wiki_file'])
+            if not args.force and os.path.exists(os.path.join(out_dir, filename)):
+                files[manifest_key] = filename
+                continue
+            tasks.append({'filename': filename, 'url': item['url'], 'key': manifest_key})
+            new_bytes += item['size']
+            new_count += 1
+        print('  {:<13} {} files, {} already downloaded, {} new ({:.0f} MB)'.format(
+            key, len(items), len(items) - new_count, new_count, new_bytes / 1e6))
+    if collections and ships:
+        print('\n{} images to download in total'.format(len(tasks)))
 
     if args.dry_run:
         for task in tasks:
@@ -458,7 +647,8 @@ def main():
 
 
 def print_summary(ship_count, no_gallery, failures):
-    print('Scanned {} ships'.format(ship_count))
+    if ship_count:
+        print('Scanned {} ships'.format(ship_count))
     if no_gallery:
         print('Ships without a gallery page ({}): {}'.format(len(no_gallery), ', '.join(sorted(no_gallery))))
     if failures:
